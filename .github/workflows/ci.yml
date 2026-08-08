@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: |
+          uv venv --python 3.13
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          uv pip install -e ".[dev]"
+
+      - name: ruff
+        run: |
+          ruff check --output-format=github .
+          ruff format --check .
+
+      - name: mypy --strict
+        run: mypy app
+
+  test:
+    runs-on: ubuntu-latest
+
+    # PostgreSQL as a service container rather than letting testcontainers
+    # start one. The runner is already inside Docker, and nesting container
+    # lifecycle management inside it is the fragile part of CI. conftest.py
+    # uses TEST_DATABASE_URL when it is set and falls back to testcontainers
+    # locally, so both paths run the same migrations and the same tests.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pulsewatch
+          POSTGRES_PASSWORD: pulsewatch
+          POSTGRES_DB: pulsewatch
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U pulsewatch"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgresql://pulsewatch:pulsewatch@localhost:5432/pulsewatch
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: |
+          uv venv --python 3.13
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          uv pip install -e ".[dev]"
+
+      # The postgres image runs a temporary server during initdb and then
+      # restarts. A health check can pass against that temporary server, so
+      # the job proceeds and the real server refuses the next connection.
+      # Require several consecutive successful queries against the actual
+      # database before trusting it.
+      - name: Wait for PostgreSQL
+        run: |
+          ok=0
+          for _ in $(seq 60); do
+            if PGPASSWORD=pulsewatch psql -h localhost -p 5432 -U pulsewatch \
+                 -d pulsewatch -tAc 'SELECT 1' >/dev/null 2>&1; then
+              ok=$((ok + 1))
+              [ "$ok" -ge 3 ] && echo "PostgreSQL ready" && exit 0
+            else
+              ok=0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL never became ready"
+          exit 1
+
+      - name: pytest
+        run: pytest -q --tb=short
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Required by build-push-action: the default docker driver cannot
+      # export a GitHub Actions cache.
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: pulsewatch:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Migrations apply to a clean database
+        run: |
+          docker network create pw
+          docker run -d --name pg --network pw \
+            -e POSTGRES_USER=pulsewatch \
+            -e POSTGRES_PASSWORD=pulsewatch \
+            -e POSTGRES_DB=pulsewatch \
+            postgres:16-alpine
+          for _ in $(seq 30); do
+            docker exec pg pg_isready -U pulsewatch && break
+            sleep 1
+          done
+          docker run --rm --network pw \
+            -e DATABASE_URL=postgresql://pulsewatch:pulsewatch@pg:5432/pulsewatch \
+            pulsewatch:ci alembic upgrade head

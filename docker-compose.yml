@@ -1,0 +1,98 @@
+# The whole system: API, worker, Beat, PostgreSQL, Redis.
+#
+# api, worker and beat are the same image with different commands — one build,
+# one set of dependencies, no chance of the worker running different code from
+# the API that scheduled it.
+
+x-app: &app
+  build: .
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql://pulsewatch:pulsewatch@postgres:5432/pulsewatch
+    REDIS_URL: redis://redis:6379/0
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pulsewatch
+      POSTGRES_PASSWORD: pulsewatch
+      POSTGRES_DB: pulsewatch
+    # Not published to the host: the app reaches it over the compose network,
+    # and binding 5432 collides with whatever PostgreSQL you already run.
+    # Add `ports: ["5433:5432"]` if you want to attach psql from outside.
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pulsewatch"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Migrations run once, as their own unit, before anything serves traffic.
+  # Running them from the API's entrypoint would mean N replicas racing to
+  # apply the same migration on every deploy.
+  migrate:
+    <<: *app
+    command: alembic upgrade head
+    restart: "no"
+
+  api:
+    <<: *app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports: ["8000:8000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/livez"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  worker:
+    <<: *app
+    command: celery -A app.workers.celery_app.celery_app worker --loglevel=info --concurrency=4
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # Exactly one Beat process. Two would double-dispatch every check.
+  # --schedule points at the writable state directory created in the image;
+  # the container runs non-root and cannot write to /app.
+  beat:
+    <<: *app
+    command: >
+      celery -A app.workers.celery_app.celery_app beat --loglevel=info
+      --schedule=/var/lib/pulsewatch/celerybeat-schedule
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
